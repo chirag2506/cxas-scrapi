@@ -24,3 +24,4 @@ graphviz
 rich
 ruff
 google-cloud-dialogflow-cx
+scikit-learn
