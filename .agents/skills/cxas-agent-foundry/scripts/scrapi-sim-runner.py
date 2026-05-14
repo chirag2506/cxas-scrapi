@@ -51,6 +51,8 @@ from cxas_scrapi.prompts import llm_user_prompts
 
 from config import load_app_name, get_project_path
 
+USER_AGENT_EXTENSION = "skill/cxas-agent-foundry/scrapi-sim-runner"
+
 
 EVALS_YAML = get_project_path("evals", "scenarios", "scenarios.yaml")
 SIM_EVALS_YAML = get_project_path("evals", "simulations", "simulations.yaml")
@@ -214,16 +216,24 @@ class EnhancedSimRunner(SimulationEvals):
         return eval_conv
 
 
+def _parse_priorities(priority):
+    """Parse a priority arg like 'P0' or 'P0,P1,P2' into an upper-cased set."""
+    if not priority:
+        return None
+    return {p.strip().upper() for p in priority.split(",") if p.strip()}
+
+
 def filter_evals(evals, priority=None, tag=None):
-    if priority:
+    prios = _parse_priorities(priority)
+    if prios:
         filtered = []
         for e in evals:
             # Check both 'priority' field and 'tags' list for priority matching
             tags = e.get("tags", [])
             prio_field = e.get("priority", "")
-            if prio_field and prio_field.upper() == priority.upper():
+            if prio_field and prio_field.upper() in prios:
                 filtered.append(e)
-            elif tags and priority.upper() in [t.upper() for t in tags]:
+            elif tags and prios.intersection({t.upper() for t in tags}):
                 filtered.append(e)
             elif not prio_field and not tags:
                 # No priority info at all — include with warning
@@ -321,8 +331,33 @@ def _format_trace_line(line, tools_map):
     return line
 
 
-def generate_html_report(results, output_path, modality, model, app_name="", wall_clock_s=None):
-    """Generate an HTML report with transcripts, tool calls, and failure details."""
+def _upload_to_gcs(output_path, html):
+    """Uploads report to GCS and returns mTLS URL or None."""
+    try:
+        from cxas_scrapi.utils.gcs_utils import GCSUtils
+        gcs = GCSUtils()
+        mtls_url = gcs.upload_string(output_path, html)
+        print(f"Report uploaded to GCS: {output_path}")
+        print(f"Authenticated URL: {mtls_url}")
+        return mtls_url
+    except Exception as e:
+        print(f"WARNING: GCS upload failed ({e}). Falling back to local file.")
+        return None
+
+
+def generate_html_report(
+    results,
+    output_path,
+    modality,
+    model,
+    app_name="",
+    wall_clock_s=None,
+):
+    """Generate an HTML report and save it locally or upload to GCS.
+
+    If output_path starts with 'gs://', the report is uploaded to GCS.
+    If the upload fails, it falls back to saving a local file.
+    """
     total = len(results)
     passed = sum(1 for r in results if r.get("passed"))
     errors = sum(1 for r in results if "error" in r)
@@ -342,7 +377,7 @@ def generate_html_report(results, output_path, modality, model, app_name="", wal
     if app_name:
         try:
             from cxas_scrapi.core.tools import Tools
-            tools_map = Tools(app_name=app_name).get_tools_map()
+            tools_map = Tools(app_name=app_name, user_agent_extension=USER_AGENT_EXTENSION).get_tools_map()
         except Exception:
             pass
 
@@ -562,8 +597,21 @@ function jumpToRun(evalName, runIdx) {{
         html += '</div></div>\n'
 
     html += "</body></html>"
+
+    if output_path.startswith("gs://"):
+        mtls_url = _upload_to_gcs(output_path, html)
+        if mtls_url:
+            return
+
+        # Fallback to local file if upload failed
+        filename = output_path.split("/")[-1]
+        if not filename.endswith(".html"):
+            filename = "report_fallback.html"
+        output_path = filename
+
     with open(output_path, "w") as f:
         f.write(html)
+    print(f"Report saved locally to: {output_path}")
 
 
 def _run_single_eval(app_name, tc, run_idx, runs, model, modality, verbose):
@@ -575,7 +623,7 @@ def _run_single_eval(app_name, tc, run_idx, runs, model, modality, verbose):
         # Each thread gets its own SimRunner instance (separate session client)
         import time as _time
         _start = _time.time()
-        sim = EnhancedSimRunner(app_name=app_name)
+        sim = EnhancedSimRunner(app_name=app_name, user_agent_extension=USER_AGENT_EXTENSION)
         conv = sim.simulate_conversation(
             test_case=tc,
             model=model,
@@ -672,7 +720,8 @@ def cmd_run(args):
                 continue
             tags = t.get("tags", [])
             if args.priority:
-                if tags and args.priority.upper() not in [tg.upper() for tg in tags]:
+                prios = _parse_priorities(args.priority)
+                if tags and not prios.intersection({tg.upper() for tg in tags}):
                     continue
                 if not tags:
                     print(f"  WARNING: sim '{name}' has no tags — including anyway (add tags for proper filtering)")
@@ -773,10 +822,19 @@ def cmd_run(args):
     with open(json_path, "w") as f:
         json.dump(output, f, indent=2, default=str)
 
-    html_path = os.path.join(REPORTS_DIR, f"sim_report_{ts}.html")
-    generate_html_report(all_results, html_path, modality, model, app_name, wall_clock_s=wall_clock_s)
+    report_path = getattr(args, "gcs_report_path", None) or os.path.join(
+        REPORTS_DIR, f"sim_report_{ts}.html"
+    )
+    generate_html_report(
+        all_results,
+        report_path,
+        modality,
+        model,
+        app_name,
+        wall_clock_s=wall_clock_s,
+    )
     print(f"\nResults: {json_path}")
-    print(f"Report:  {html_path}")
+    print(f"Report:  {report_path}")
 
 
 def main():
@@ -807,6 +865,12 @@ def main():
     p_run.add_argument("--runs", type=int, default=1)
     p_run.add_argument("--parallel", type=int, default=1, help="Number of concurrent sessions (default: 1)")
     p_run.add_argument("--verbose", action="store_true")
+    p_run.add_argument(
+        "--gcs-report-path",
+        type=str,
+        default=None,
+        help="GCS URI to upload report to (e.g. gs://bucket/report.html)",
+    )
 
     args = parser.parse_args()
     commands = {"list": cmd_list, "convert": cmd_convert, "run": cmd_run}

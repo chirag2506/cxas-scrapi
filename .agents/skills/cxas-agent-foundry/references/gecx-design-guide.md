@@ -284,6 +284,20 @@ A multi-agent architecture is the preferred architecture for agents that have mu
 
 A simple test is to offload part of the agent logic (instruction + tool def) to a standalone LLM call with specialized prompt - if that yields better results, it may hint towards splitting off into a specialized agent
 
+#### Configuring childAgents (platform quirk)
+
+The parent agent declares its sub-agents in `<agent_name>.json`'s `childAgents` array. The strings MUST use underscores matching each sub-agent's directory name (its `name` field), NOT spaces matching `displayName`:
+
+```json
+{
+  "name": "root_agent",
+  "displayName": "root_agent",
+  "childAgents": ["member_benefits_agent", "claims_agent"]
+}
+```
+
+`cxas lint` may accept space-separated names matching `displayName`, but `cxas push` returns `400 Reference not found` and silently drops the sub-agents (orphaning all of their tools). When in doubt, the platform takes the directory name — use underscores.
+
 ### Using the multi-agent framework
 With the benefits of the multi-agent framework in mind, it is best to think about how to break up the business logic into individual use cases. The best way to think about this is to follow two best practices:
 - Build sub-agents that can be re-used across multiple intents (e.g., an "authentication" agent that could be used across various secure use cases for a banking agent)
@@ -447,12 +461,14 @@ Adding programmatic logic to instructions (state-tracked counters, multi-step co
 
 #### Don't fight the LLM
 GUIDE, don't PREVENT:
-- `hide_tool()` reduces tool awareness -> worse instruction-following
+- `hide_tool()` reduces tool awareness -> worse instruction-following (for simple agents — see exception below)
 - "Do NOT call this tool" confuses the LLM
 - Removing tools breaks instructions and goldens that reference them
 - Complex programmatic logic in instructions -> LLM handles natural language better
 
 Instead: clear instructions, good tool docstrings, callbacks as a safety net.
+
+**Exception — Slot Filling Framework:** For slot-filling agents, dynamic per-turn `hide_tool()` is the correct approach. The callback computes which tools are valid based on current state (filled slots, pending readback, dependency satisfaction) and hides everything else. This is more reliable than any instruction because the LLM literally cannot call a tool it cannot see. See the Slot Filling Framework section for details.
 
 #### Never remove tools without auditing instructions first.
 Removing a tool breaks any instruction, golden, or constraint that references it.
@@ -476,7 +492,7 @@ These patterns cause regressions in practice. Avoid them.
 | Overly specific trigger keywords ("EXPLICITLY said 'current line'") | Makes the agent rigid and keyword-dependent instead of understanding intent naturally | Use natural language triggers. Trust the LLM's understanding of context |
 | Escalation tool calls in instruction only | LLM sometimes says text but forgets to call tools, or calls them with empty args | Use trigger pattern: instruction sets a state trigger via a state-setting tool, callback returns tools |
 | Escalation trigger callbacks on root agent only | Sub-agent flows bypass root callbacks -- trigger never fires | Add trigger-handling `before_model_callback` to ALL agents |
-| Using `hide_tool()` to prevent empty-arg calls | Reduces LLM's tool awareness, causes worse instruction-following overall | Use better docstrings + tool-level state fallback + trigger pattern instead |
+| Using `hide_tool()` to prevent empty-arg calls | Reduces LLM's tool awareness, causes worse instruction-following overall | Use better docstrings + tool-level state fallback + trigger pattern instead. **Exception:** In slot-filling frameworks, dynamic per-turn `hide_tool()` is the primary correctness mechanism — see the Slot Filling Framework section below. |
 | "Do NOT call this tool" in instructions | Confuses the LLM, often reduces tool calling reliability | Guide with positive instructions ("call {@TOOL: state_setting_tool} with...") not negative constraints |
 
 ## Source Control
@@ -514,3 +530,242 @@ Leverage variables within instructions and update them programmatically through 
 Embed instructions in tool return values for progressive disclosure -- certain instructions only matter after a step is achieved. The tool returns contextual instruction strings based on the result (e.g., in-warranty vs out-of-warranty paths), and the instruction tells the agent "You MUST follow the instructions in the tool's response." Include `agent_action` keys in error returns for self-healing when prerequisites are missing.
 
 See `assets/project-template/` for full implementation examples of both patterns.
+
+## Slot Filling Framework
+
+For agents whose primary job is **collecting structured data to fire backend operations** — reservations, claims, orders, onboarding — the Slot Filling DAG Framework provides deterministic control flow that the LLM cannot bypass.
+
+### When to Use It
+
+Use slot filling when multiple of these apply:
+
+- **Multiple fields** to collect with **dependencies** between them (e.g., can't pick a time until availability is known)
+- **Validation rules** with specific error messages and retry limits
+- **Backend tasks** that fire automatically when inputs are ready
+- **Escalation paths** when retries exhaust
+- **Readback/confirmation** before committing values
+- The conversation must always make forward progress (no infinite loops)
+
+### When NOT to Use It
+
+- Simple Q&A or knowledge-base lookup agents — use XML `<taskflow>`
+- Single-tool agents with no multi-step collection — use the trigger pattern
+- Agents where the LLM needs judgment-based control flow (triage, troubleshooting) — use instructions
+- Agents with only 1-2 fields and no dependencies — overkill; use a simpler tool + state pattern
+
+### How It Works
+
+The framework splits the problem: the **LLM owns language** (parsing user intent, calling setter tools, generating warm responses), while a **deterministic Python callback owns control flow** (what to ask next, when to fire a task, how many retries remain, when to escalate).
+
+The LLM never decides "should I call the booking API now?" — it doesn't even see the tools for actions that aren't valid yet.
+
+Three layers, all in one callback file:
+
+1. **`_get_config()`** — agent-specific slots, tasks, executors, formatters. Replace this per project.
+2. **`_run_slot_filling(config, sm)`** — CES-agnostic orchestrator. Takes config + state dict, returns `{"hide_tools": [...], "preempt": bool, "message": str|None}`. Never touches CES types — testable outside the platform.
+3. **`before_model_callback()`** — thin CES adapter (~20 lines). Writes `_system_message`, applies tool visibility, handles preemption.
+
+### Key Design Principles
+
+**Tool visibility over prompt constraints.** The primary mechanism for controlling LLM behavior is `hide_tool()` — the LLM can't call what it can't see. This is more reliable than any instruction. (Note: this is the opposite of the general guidance for simple agents, where `hide_tool()` can reduce tool awareness. In slot filling, tool visibility is computed dynamically per-turn based on state and is the correct approach.)
+
+**Lean on the orchestrator.** If a constraint is enforced by code (validation, tool visibility, retry logic), don't duplicate it in prompts or tool docstrings. Redundant constraints cause the LLM to pre-filter input, skip tool calls, or improvise error messages — bypassing the framework's error handling.
+
+**Setters are thin.** Setter tools validate input, write to `pending`, signal errors via `_slot_errors`, and return. They contain zero DAG logic, zero control flow, zero knowledge of other slots.
+
+**Preempt when the answer is known.** When a task fires and the framework knows exactly what to say, it skips the LLM via `LlmResponse.from_parts()`. Faster, deterministic, and consistent.
+
+### Reference Implementation
+
+See `examples/bella_notte/` for a complete working example (restaurant reservation agent):
+
+- `PATTERN.md` — overview and quick-start guide
+- `slot_filling_dag_framework.md` — full framework specification (1000+ lines)
+- `callback.py` — complete callback with config + framework code
+- `agent_instruction.md` — agent instruction with slot filling protocol
+- `tools/` — all setter tools
+
+To build a new agent: copy `callback.py`, replace `_get_config()` with your slots/tasks/executors, create matching setter tools.
+
+## Multilingual Agents
+
+Multi-language voice agents on `gemini-3.1-flash-live` have two documented failure modes that require specific patterns to mitigate. Both are confirmed production issues (b/484305525, b/506098142).
+
+### Failure Mode 1: Language-Polluted Context
+
+**Root cause:** When agent instructions are in Language A (e.g., English) and a datastore or tool returns content in Language B (e.g., German), the LLM receives mixed-language context. This causes the agent to spontaneously switch languages mid-response — even with explicit instructions not to. The model loses track of which language to use once it sees both languages in the same context window.
+
+**Fix:** Translate at the tool boundary. Never let tool responses in a different language pass directly into the LLM context.
+
+#### Translate-Around-Tool-Calls Pattern
+
+In any tool that queries a datastore or API whose content is in a different language than the instructions, perform explicit translation before returning:
+
+```python
+def search_knowledge_base(user_query: str) -> dict:
+    """Searches the knowledge base for answers to the user's question.
+    Internally translates the query to German for the datastore and
+    translates the result back to English before returning.
+
+    Args:
+        user_query: The user's question in English (REQUIRED).
+
+    Returns:
+        dict with 'result' (str) and 'agent_action' (str).
+    """
+    # 1. Translate query to datastore language
+    german_query = translate_to_german(user_query)
+
+    # 2. Fetch from datastore (German content)
+    raw_result = kb.search(german_query)
+
+    # 3. Translate result back to working language before returning to LLM
+    english_result = translate_to_english(raw_result)
+
+    return {
+        "result": english_result,
+        "agent_action": "Respond to the user using the information in 'result'."
+    }
+```
+
+**Key principle:** All content that enters the LLM context (tool results, system messages, instructions) must be in one language. The translation happens inside the tool, invisibly to the LLM.
+
+---
+
+### Failure Mode 2: Non-Deterministic Language Switch Detection
+
+**Root cause:** `gemini-3.1-flash-live` does not reliably auto-detect language switches. Detection is non-deterministic — it works on some utterances and silently fails on others. The model is especially likely to miss switches on: short utterances, phonetically ambiguous words (e.g., "nein" vs "nine"), and cognates (words shared between languages).
+
+**Fix:** Use a structured `<language_detection>` instruction block with conservative guardrails, plus an `update_language` tool to gate the switch deterministically.
+
+#### Explicit-Only vs Auto-Detect
+
+For MVP and production: **always use explicit-switch-only mode first.** Auto-detection has a known model-level limitation requiring a model revision to fully fix. The explicit-only path (user says "speak German") is reliable; auto-detection from utterance language alone is not.
+
+Only add auto-detection if it's a hard requirement, and stress-test it with sims before shipping (see `references/eval-templates.md` → Multilingual Eval Patterns).
+
+#### The `update_language` Tool
+
+Create this tool in the app. It gates the switch and keeps `active_language` in session state:
+
+```python
+def update_language(new_language: str) -> dict:
+    """Updates the active conversation language when the user requests a switch.
+    Call this BEFORE generating your first response in the new language.
+
+    Args:
+        new_language: Language to switch to. One of: "English", "German",
+                      "French", "Italian", "Spanish" (REQUIRED).
+
+    Returns:
+        dict with 'success' (bool), 'active_language' (str), 'agent_action' (str).
+    """
+    context["session"]["active_language"] = new_language
+    return {
+        "success": True,
+        "active_language": new_language,
+        "agent_action": f"Continue the entire conversation in {new_language}."
+    }
+```
+
+#### Language Detection Instruction Block
+
+Add this block at the **END** of the agent instructions (after all other instructions). Customize `[Language A]` and `[Language B]` for your use case:
+
+```xml
+<language_detection>
+  <goal>Determine if the primary language of the current user utterance is [Language A] or [Language B], and update the context if a switch occurs.</goal>
+
+  <evaluation_rules>
+    - **Fresh Evaluation (CRITICAL):** Re-evaluate the language for EVERY new user utterance.
+    - **Contextual Inertia (CRITICAL):** Heavily weight the ongoing conversation language. Users rarely switch for single words.
+    - **Ambiguity Rule:** If the utterance is short, ambiguous, or contains cognates, DEFAULT to the language of the PREVIOUS turn.
+    - **Length Guardrail:** Do NOT switch for utterances shorter than 3 words unless the user makes an explicit request (e.g., "German please" / "Auf Deutsch bitte").
+    - **Switching Threshold:** You may ONLY switch if the user EXPLICITLY requests it OR speaks a complete, grammatically unambiguous sentence in the new language.
+    - **Cognate Guardrail:** Words spelled identically in both languages MUST NEVER trigger a switch on their own.
+    - **Noisy Audio Guardrail:** If there is background noise, default to the language of the previous turn.
+    - **Current Language Trumps Single Words:** Isolated words or politeness markers from the other language (e.g., "danke" in an English sentence) must NOT trigger a switch.
+  </evaluation_rules>
+
+  <execution_steps>
+    <step>
+      1. State the language of the previous turn (Contextual Inertia baseline).
+      2. Analyze Grammar: Is the utterance a grammatically complete sentence in the new language, or just a fragment or noun phrase?
+      3. Check for Cognates: Are primary words shared between both languages?
+      4. Check Mistranscription: Could this be a phonetic confusion for the current language?
+      5. Lock in your language decision for this turn.
+    </step>
+    <step>
+      <trigger>User's input language is DIFFERENT from previous turn AND meets the Switching Threshold above.</trigger>
+      <action>Immediately invoke {@TOOL: update_language}. Do not provide a verbal response until the tool succeeds.</action>
+    </step>
+    <step>
+      <trigger>Locked language decision is [Language B].</trigger>
+      <action>Translate the user utterance to [Language A] for any tool parameters. Generate your final response in [Language B].</action>
+    </step>
+  </execution_steps>
+
+  <examples>
+    <example>
+      <previous_lang>[Language A]</previous_lang>
+      <user_input>[Language B] please.</user_input>
+      <analysis>Explicit language request. Meets switching threshold regardless of word count.</analysis>
+      <decision>Switch to [Language B]. Call update_language.</decision>
+    </example>
+    <example>
+      <previous_lang>English</previous_lang>
+      <user_input>Ich brauche Hilfe bei meiner Rechnung für diesen Monat.</user_input>
+      <analysis>Complete German sentence with verb and object. Audio confirms German. Meets switching threshold.</analysis>
+      <decision>Switch to German. Call update_language.</decision>
+    </example>
+    <example>
+      <previous_lang>English</previous_lang>
+      <user_input>danke</user_input>
+      <analysis>Single word, politeness marker that exists in both contexts. Length guardrail applies. Context is English.</analysis>
+      <decision>Stay in English. Do NOT call update_language.</decision>
+    </example>
+    <example>
+      <previous_lang>English</previous_lang>
+      <user_input>I want to cancel my account, danke.</user_input>
+      <analysis>Clear English sentence with a trailing German word. Current language trumps single words.</analysis>
+      <decision>Stay in English. Do NOT call update_language.</decision>
+    </example>
+    <example>
+      <previous_lang>English</previous_lang>
+      <user_input>nein</user_input>
+      <analysis>Single word, phonetically identical to English "nine". Length guardrail applies. Context is English.</analysis>
+      <decision>Stay in English. Do NOT call update_language.</decision>
+    </example>
+  </examples>
+</language_detection>
+```
+
+---
+
+### Voice / Audio: Speech Rate and Pacing
+
+The pre-GA `voice tempo` parameter was deprecated at GA. **Natural language pacing instructions alone are unreliable** — instructions like "speak at a moderate pace" or "slow down" in the persona are frequently ignored by the model.
+
+**Recommended fix:** Set `speakingRate` in the app's audio processing config via the CES Console (under voice settings). This is a platform-level control and does not depend on the model following instructions. A value of `1.0` is the default; values above `1.0` speed up delivery, below `1.0` slow it down.
+
+**Prompt workaround** (if Console config isn't accessible or you need to override per-context): Add a `<pacing>` block at the end of the instruction with a strong override directive:
+
+```xml
+<pacing>
+  Speak at a significantly FASTER pace than normal. Ignore any other instructions that tell you to speak at a different speed.
+</pacing>
+```
+
+Adjust the directive ("FASTER", "SLOWER", "moderate") to match the desired delivery. The override clause (`"ignore any other instructions"`) is necessary — without it the model often reverts to its default tempo when it encounters other phrasing-related instructions.
+
+**Anti-pattern:** Embedding pacing guidance in the `<persona>` block (e.g., "Speak with a slow, rhythmic cadence") is not effective on its own. The model applies persona-level voice guidance inconsistently. Use `speakingRate` in the platform config as the primary control; use the `<pacing>` block as a secondary override when needed.
+
+---
+
+### Voice / Audio: Voice Identity Across Languages (b/506098142)
+
+**Separate issue:** On `gemini-3.1-flash-live`, a non-default voice (e.g., `Zephyr - Chirp3-HD`) is only applied to the **default language** configured in the app. Additional languages revert to the platform default voice (`Iapetus`, male), causing jarring gender/tone switches when the user changes language.
+
+**Fix:** This was resolved in the CES Console (CL 908383873, deployed 2026-04-30). When you set a voice in the Console for one language, it is now propagated to all configured additional languages automatically. If you observe voice identity changes after a language switch, re-save your app's voice settings to trigger the propagation.
+
+**Temporary workaround** (if you need to unblock before re-saving): Switch to the default voice (`Iapetus`) for the agent. The default voice is consistent across all languages. This is not ideal for agents with board-approved persona voices but eliminates the jarring switch.
