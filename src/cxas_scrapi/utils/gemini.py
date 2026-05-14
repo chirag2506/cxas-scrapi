@@ -183,7 +183,7 @@ class GeminiGenerate:
             await asyncio.sleep(sleep_time)
 
         return None
-    
+
     def generate_embeddings(
         self,
         contents: list[str],
